@@ -34,7 +34,6 @@ struct nonconst_sum {
 template <typename T, typename F>
 concept supports_sum = requires(const xpu::range<2uz>& range, T* output, F contribution) {
   xpu::parallel_reduce_sum(range, output, contribution);
-  xpu::parallel_reduce_sum_bytes<T>(range, contribution);
 };
 
 static_assert(supports_sum<int, sum_values<int>>);
@@ -54,16 +53,6 @@ inline auto run_sum_type() -> int {
     const auto range = xpu::range<2uz>{
       {2uz, 1uz}, {6uz, 1uz + 3uz * count}, {2uz, 3uz}
     };
-    const auto required_bytes{xpu::parallel_reduce_sum_bytes<T>(range, contribution)};
-    const auto empty{count == 0uz};
-    const auto invalid_empty_query{empty && required_bytes != 0uz};
-
-    if (invalid_empty_query) {
-      const auto failure{test::fail("empty reduction requested scratch storage")};
-
-      return failure;
-    }
-
     auto expected{T{}};
 
     for (auto row{2uz}; row < 6uz; row += 2uz) {
@@ -72,16 +61,11 @@ inline auto run_sum_type() -> int {
       }
     }
 
-    const auto capacity{required_bytes + 64uz};
-    auto scratch{xpu::buffer<std::byte>{capacity}};
     const auto initial{T{91}};
     xpu::copy_n(output.data(), &initial, 1uz);
 
     for (auto repeat{0uz}; repeat < 2uz; ++repeat) {
-      xpu::parallel_reduce_sum(
-        range, output.data(), contribution,
-        empty ? nullptr : scratch.data(), empty ? 0uz : capacity
-      );
+      xpu::parallel_reduce_sum(range, output.data(), contribution);
 
       auto actual{T{}};
       xpu::copy_n(&actual, output.data(), 1uz);
@@ -116,13 +100,9 @@ struct sum_coordinates {
 template <std::size_t dims>
 inline auto check_coordinate_sum(const xpu::range<dims>& range, int expected) -> int {
   const auto contribution{sum_coordinates{}};
-  const auto scratch_bytes{xpu::parallel_reduce_sum_bytes<int>(range, contribution)};
-  auto scratch{xpu::buffer<std::byte>{scratch_bytes}};
   auto output{xpu::buffer<int>{1uz}};
 
-  xpu::parallel_reduce_sum(
-    range, output.data(), contribution, scratch.data(), scratch_bytes
-  );
+  xpu::parallel_reduce_sum(range, output.data(), contribution);
 
   auto actual{0};
   xpu::copy_n(&actual, output.data(), 1uz);

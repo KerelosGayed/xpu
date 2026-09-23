@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <type_traits>
 #include <utility>
 #include <xpu/config.hpp>
@@ -38,6 +40,26 @@ inline auto device_SMs() -> unsigned int {
   };
 
   return cached;
+}
+
+// the default pool trims to 0 bytes at every sync, so stream-ordered scratch would
+// go back to the OS after each synchronized call (~0.8ms per reduce); keep it cached
+inline auto retain_default_pool() -> void {
+  static const auto once{[] {
+      auto device{0};
+      auto pool{cudaMemPool_t{}};
+      auto threshold{std::numeric_limits<std::uint64_t>::max()};
+      xpu::cu_check(cudaGetDevice(&device));
+      xpu::cu_check(cudaDeviceGetDefaultMemPool(&pool, device));
+      xpu::cu_check(cudaMemPoolSetAttribute(
+        pool, cudaMemPoolAttrReleaseThreshold, &threshold
+      ));
+
+      return true;
+    }()
+  };
+
+  static_cast<void>(once);
 }
 
 template <typename Kernel> [[nodiscard]]
@@ -247,17 +269,6 @@ inline auto reduction_input(
   const auto input{thrust::make_transform_iterator(indices, transform)};
 
   return input;
-}
-
-template <arithmetic T, typename Input> [[nodiscard]]
-inline auto reduction_bytes(Input input, std::ptrdiff_t count) -> std::size_t {
-  auto required_bytes{0uz};
-
-  xpu::cu_check(cub::DeviceReduce::Sum(
-    nullptr, required_bytes, input, static_cast<T*>(nullptr), count
-  ));
-
-  return required_bytes;
 }
 
 template <std::size_t dims, typename F>
@@ -476,34 +487,15 @@ inline auto parallel_reduce_sum_impl(
   const xpu::range<dims>& range,
   std::size_t total,
   T* output_ptr,
-  F&& contribution,
-  [[maybe_unused]] void* scratch = nullptr,
-  [[maybe_unused]] std::size_t scratch_bytes = 0uz
+  F&& contribution
 ) -> void {
 #if defined(XPU_CUDA)
-  using function_t = std::decay_t<F>;
-
-  const auto transform{reduction_contribution<dims, T, function_t>{
-    range, function_t{std::forward<F>(contribution)}
-  }};
-
-  const auto indices{thrust::counting_iterator<std::size_t>{0uz}};
-  const auto input{thrust::make_transform_iterator(indices, transform)};
-
+  const auto input{reduction_input<T>(range, std::forward<F>(contribution))};
   const auto count{xpu::detail::checked_cast<std::ptrdiff_t>(total)};
-  const auto required_bytes{reduction_bytes<T>(input, count)};
 
-  const auto insufficient_scratch{
-    scratch == nullptr || scratch_bytes < required_bytes
-  };
-
-  if (insufficient_scratch) {
-    xpu::detail::checked_error("insufficient reduction scratch storage");
-  }
-
-  xpu::cu_check(cub::DeviceReduce::Sum(
-    scratch, scratch_bytes, input, output_ptr, count
-  ));
+  // cub owns the scratch: cudaMallocAsync/cudaFreeAsync from the device's default pool
+  xpu::detail::retain_default_pool();
+  xpu::cu_check(cub::DeviceReduce::Sum(input, output_ptr, count));
 #else
   if (range.step[dims - 1uz] == 1uz) {
     *output_ptr = parallel_reduce_cpu<true, T>(range, total, contribution);
@@ -525,43 +517,12 @@ inline auto parallel_for(
   detail::parallel_for_impl(range, std::forward<F>(fcn));
 }
 
-template <arithmetic T, std::size_t dims, typename F>
-  requires detail::sum_contribution<F, T, dims>
-[[nodiscard]]
-inline auto parallel_reduce_sum_bytes(
-  [[maybe_unused]] const xpu::range<dims>& range,
-  [[maybe_unused]] F&& contribution
-) -> std::size_t {
-  static_assert(dims > 0uz, "ERROR: Dimension must be greater than 0.");
-
-  auto required_bytes{0uz};
-
-#if defined(XPU_CUDA)
-  const auto total{xpu::detail::num_itrs(range)};
-  const auto empty{total == 0uz};
-
-  if (empty) {
-
-    return required_bytes;
-  }
-
-  const auto input{detail::reduction_input<T>(range, std::forward<F>(contribution))};
-  const auto count{xpu::detail::checked_cast<std::ptrdiff_t>(total)};
-
-  required_bytes = detail::reduction_bytes<T>(input, count);
-#endif
-
-  return required_bytes;
-}
-
 template <std::size_t dims, arithmetic T, typename F>
   requires detail::sum_contribution<F, T, dims>
 inline auto parallel_reduce_sum(
   const xpu::range<dims>& range,
   T* output_ptr,
-  F&& contribution,
-  void* scratch = nullptr,
-  std::size_t scratch_bytes = 0uz
+  F&& contribution
 ) -> void {
   static_assert(dims > 0uz, "ERROR: Dimension must be greater than 0.");
 
@@ -579,7 +540,7 @@ inline auto parallel_reduce_sum(
   }
 
   detail::parallel_reduce_sum_impl(
-    range, total, output_ptr, std::forward<F>(contribution), scratch, scratch_bytes
+    range, total, output_ptr, std::forward<F>(contribution)
   );
 }
 
